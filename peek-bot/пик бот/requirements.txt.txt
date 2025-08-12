@@ -1,7 +1,4 @@
-fastapi
-uvicorn
+aiogram==2.25.1
 requests
-beautifulsoup4
-lxml
 
 
