@@ -1,7 +1,4 @@
-fastapi
-uvicorn
-aiogram==3.0.0b7
-requests
-beautifulsoup4
-pydantic
-aiofiles
+git add requirements.txt
+git commit -m "add requirements.txt"
+git push
+
