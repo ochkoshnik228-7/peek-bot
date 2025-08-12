@@ -1,174 +1,54 @@
 import os
-import sqlite3
 import requests
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
+from flask import Flask, request
 
-BOT_TOKEN = "8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA"
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# Твой токен бота
+BOT_TOKEN = "ТВОЙ_ТОКЕН"
+CHAT_ID = "ТВОЙ_CHAT_ID"
 
-DB_FILE = "users.db"
+# HLTV API
+HLTV_API_URL = "https://hltv-api.vercel.app/api/matches"
 
-# Создание базы данных
-conn = sqlite3.connect(DB_FILE)
-cur = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance REAL
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS bets (
-    user_id INTEGER,
-    match_id TEXT,
-    team TEXT,
-    amount REAL,
-    coeff REAL
-)""")
-conn.commit()
-conn.close()
+app = Flask(__name__)
 
-HLTV_API = "https://hltv-api.vercel.app/api/matches"  # бесплатный API
+def send_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    requests.post(url, json=payload)
 
-def get_upcoming_cs_matches():
+def get_upcoming_matches():
     try:
-        r = requests.get(HLTV_API, timeout=10)
-        matches = r.json()
-        now = datetime.utcnow()
+        response = requests.get(HLTV_API_URL)
+        matches = response.json()
         upcoming = []
-        for m in matches:
-            if "counter-strike" not in m.get("game", "").lower():
-                continue
-            ts = datetime.utcfromtimestamp(m["date"]/1000)
-            if now < ts <= now + timedelta(days=7) and not m.get("live"):
-                upcoming.append({
-                    "id": m["id"],
-                    "team1": m["team1"]["name"],
-                    "team2": m["team2"]["name"],
-                    "odds1": m.get("odds", {}).get("team1", 1.5),
-                    "odds2": m.get("odds", {}).get("team2", 2.5),
-                    "time": ts
-                })
+        for match in matches:
+            if match.get("status") == "upcoming":
+                upcoming.append(match)
         return upcoming
     except Exception as e:
-        print("Ошибка получения матчей:", e)
+        print(f"Ошибка при запросе HLTV: {e}")
         return []
 
-def get_match_winner(match_id):
-    try:
-        r = requests.get(f"https://hltv-api.vercel.app/api/match/{match_id}", timeout=10)
-        data = r.json()
-        if data.get("winner"):
-            return data["winner"]["name"]
-        return None
-    except:
-        return None
+@app.route("/")
+def home():
+    return "HLTV бот работает!"
 
-@dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    user = cur.fetchone()
-    if not user:
-        cur.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (message.from_user.id, 10000))
-        conn.commit()
-        await message.answer("Добро пожаловать! На ваш баланс зачислено 10000 Peek.")
-    else:
-        await message.answer("С возвращением!")
-    conn.close()
-
-@dp.message_handler(commands=["balance"])
-async def balance_cmd(message: types.Message):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    bal = cur.fetchone()
-    conn.close()
-    if bal:
-        await message.answer(f"Ваш баланс: {bal[0]} Peek")
-    else:
-        await message.answer("Вы не зарегистрированы. Напишите /start")
-
-@dp.message_handler(commands=["matches"])
-async def matches_cmd(message: types.Message):
-    matches = get_upcoming_cs_matches()
+@app.route("/check_matches", methods=["GET"])
+def check_matches():
+    matches = get_upcoming_matches()
     if not matches:
-        await message.answer("Нет предстоящих матчей по CS в ближайшие 7 дней.")
-        return
-    kb = types.InlineKeyboardMarkup()
-    for m in matches:
-        kb.add(types.InlineKeyboardButton(
-            f"{m['team1']} ({m['odds1']}) vs {m['team2']} ({m['odds2']})",
-            callback_data=f"match_{m['id']}"
-        ))
-    await message.answer("Выберите матч:", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("match_"))
-async def match_selected(callback_query: types.CallbackQuery):
-    match_id = callback_query.data.split("_")[1]
-    matches = get_upcoming_cs_matches()
-    match = next((m for m in matches if str(m["id"]) == match_id), None)
-    if not match:
-        await callback_query.message.answer("Матч не найден.")
-        return
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(match["team1"], callback_data=f"pick_{match_id}_1"))
-    kb.add(types.InlineKeyboardButton(match["team2"], callback_data=f"pick_{match_id}_2"))
-    await callback_query.message.answer("Выберите команду:", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("pick_"))
-async def pick_team(callback_query: types.CallbackQuery):
-    _, match_id, team_num = callback_query.data.split("_")
-    matches = get_upcoming_cs_matches()
-    match = next((m for m in matches if str(m["id"]) == match_id), None)
-    if not match:
-        await callback_query.message.answer("Матч не найден.")
-        return
-    team = match["team1"] if team_num == "1" else match["team2"]
-    coeff = match["odds1"] if team_num == "1" else match["odds2"]
-    await callback_query.message.answer(f"Введите сумму Peek для ставки на {team}:")
-
-    @dp.message_handler()
-    async def get_bet_amount(msg: types.Message):
-        try:
-            amount = float(msg.text)
-        except:
-            await msg.answer("Введите число.")
-            return
-        conn = sqlite3.connect(DB_FILE)
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM users WHERE user_id=?", (msg.from_user.id,))
-        bal = cur.fetchone()
-        if not bal or bal[0] < amount:
-            await msg.answer("Недостаточно средств.")
-            conn.close()
-            return
-        cur.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, msg.from_user.id))
-        cur.execute("INSERT INTO bets (user_id, match_id, team, amount, coeff) VALUES (?, ?, ?, ?, ?)",
-                    (msg.from_user.id, match_id, team, amount, coeff))
-        conn.commit()
-        conn.close()
-        await msg.answer(f"Ставка {amount} Peek на {team} принята! Ждём результатов.")
-        dp.message_handlers.unregister(get_bet_amount)
-
-async def check_results():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, match_id, team, amount, coeff FROM bets")
-    bets = cur.fetchall()
-    for user_id, match_id, team, amount, coeff in bets:
-        winner = get_match_winner(match_id)
-        if winner:
-            if winner == team:
-                win_amount = amount * coeff
-                cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (win_amount, user_id))
-                await bot.send_message(user_id, f"Поздравляем! Вы выиграли {win_amount} Peek!")
-            else:
-                await bot.send_message(user_id, "Упсс... вы проиграли :(")
-            cur.execute("DELETE FROM bets WHERE match_id=?", (match_id,))
-    conn.commit()
-    conn.close()
+        send_message("Нет предстоящих матчей CS:GO в ближайшее время.")
+    else:
+        for m in matches:
+            team1 = m.get("team1", {}).get("name", "Неизвестно")
+            team2 = m.get("team2", {}).get("name", "Неизвестно")
+            event = m.get("event", {}).get("name", "Неизвестно")
+            time = m.get("date", "Неизвестно")
+            send_message(f"📢 <b>Предстоящий матч</b>\n🏆 {event}\n⚔ {team1} vs {team2}\n🕒 {time}")
+    return "Проверка завершена."
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
+
