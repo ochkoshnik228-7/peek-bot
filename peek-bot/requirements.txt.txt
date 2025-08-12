@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-aiogram==3.0.0b7
 requests
 beautifulsoup4
-pydantic
-aiofiles
+lxml
+
+
