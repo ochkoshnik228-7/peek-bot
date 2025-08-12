@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 import uvicorn
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+https://api.telegram.org/bot8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA/setWebhook?url=https://https://peek-bot.onrender.com/webhook/8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA
 
 BOT_TOKEN = 8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL")
@@ -306,6 +307,7 @@ async def telegram_webhook(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+
 
 
 
