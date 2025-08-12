@@ -1,38 +1,38 @@
+# main.py
 import os
 import re
 import sqlite3
-import time
 import asyncio
-from datetime import datetime
+import time
 import requests
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
 import uvicorn
 import json
 
-# ---------------------------
-# Настройки (токен встроен)
-# ---------------------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA"
-WEBHOOK_BASE = os.getenv("WEBHOOK_URL")  # ставим в Render: https://your-service.onrender.com
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL")  # e.g. https://peek-bot.onrender.com
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_FULL = (WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH) if WEBHOOK_BASE else None
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# БД и константы
-DB_FILE = "peek_bot.db"
+DB_FILE = "peek_hltv.db"
 START_BALANCE = 10000.0
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # в секундах
-DEFAULT_STAKE = None  # если None — просим ввести сумму, иначе фиксированная сумма
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # seconds between background checks
+MAX_LOOKAHEAD_DAYS = 7  # only show matches within next 7 days
 
-# Ссылка мобильного раздела Winline
-WINLINE_URL = "https://m.winline.ru/stavki/sport/kibersport"
+HLTV_API_BASES = [
+    "https://hltv-api.vercel.app/api",   # unofficial deployment
+    "https://hltv-api.vercel.app"        # alternate
+]
+HLTV_SITE_MATCHES = "https://www.hltv.org/matches"
+HLTV_SITE_BASE = "https://www.hltv.org"
 
 app = FastAPI()
 
-# ---------------------------
-# База данных
-# ---------------------------
+# ---------------- DB ----------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cur = conn.cursor()
 cur.executescript("""
@@ -65,21 +65,20 @@ CREATE TABLE IF NOT EXISTS matches_cache (
 """)
 conn.commit()
 
-# in-memory sessions: awaiting amount from user, selected match per user, etc.
-user_sessions = {}          # user_id -> {"stage":"await_amount","match_id":..., "team":..., "coef":...}
-# keep a small LRU cache? for now DB stores matches_cache
+# in-memory sessions waiting for amount
+user_sessions = {}  # user_id -> {stage, match_id, team, coef, match_name}
 
-# ---------------------------
-# Вспомогательные функции Telegram
-# ---------------------------
-def tg_send_message(chat_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML"):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+# ---------------- Telegram helpers ----------------
+def tg_send(chat_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML"):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
         requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
-        print("tg_send_message error:", e, payload)
+        print("tg_send error:", e, payload)
 
 def tg_answer_callback(callback_id: str, text: str = None):
     payload = {"callback_query_id": callback_id}
@@ -90,323 +89,445 @@ def tg_answer_callback(callback_id: str, text: str = None):
     except Exception as e:
         print("tg_answer_callback error:", e, payload)
 
-# ---------------------------
-# Парсинг Winline — матчи CS
-# ---------------------------
-def fetch(url: str) -> str:
-    try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        print("fetch error", e, url)
-        return None
-
-def parse_matches(html: str):
+# ---------------- HLTV helpers: try JSON API, fallback to scraping ----------------
+def try_hltv_api_matches():
     """
-    Возвращает список матчей вида:
-    [{"match_id": str, "name": str, "team1": str, "team2": str, "start_ts": int|None,
-      "coef1": float|None, "coef2": float|None, "link": str}, ...]
+    Try to fetch upcoming matches via unofficial HLTV API deployments.
+    Return list of dicts with keys: match_id, name, team1, team2, start_ts, coef1, coef2, link
     """
-    soup = BeautifulSoup(html, "lxml")
-    out = []
-
-    # попытки найти карточки матчей — разные селекторы на случай смены верстки
-    # основной подход: найти ссылки на события и текст с командами и рядом коэффициенты
-    anchors = soup.find_all("a", href=True)
-    for a in anchors:
-        text = a.get_text(" ", strip=True)
-        parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
-        comb = (text + " " + parent_text).lower()
-        # фильтруем только Counter-Strike
-        if not ("counter" in comb or "counter-strike" in comb or "counter strike" in comb):
-            continue
-
-        href = a["href"]
-        link = href if href.startswith("http") else "https://m.winline.ru" + href
-
-        # извлекаем команды
-        m = re.search(r"([A-Za-z0-9\-\.\s]{2,60})\s*[—\-\\/]\s*([A-Za-z0-9\-\.\s]{2,60})", text)
-        if not m:
-            m = re.search(r"([A-Za-z0-9\-\.\s]{2,60})\s*[—\-\\/]\s*([A-Za-z0-9\-\.\s]{2,60})", parent_text)
-        if m:
-            t1 = m.group(1).strip()
-            t2 = m.group(2).strip()
-            name = f"{t1} / {t2}"
-        else:
-            parts = text.split("/")
-            if len(parts) >= 2:
-                t1 = parts[0].strip()
-                t2 = parts[1].strip()
-                name = f"{t1} / {t2}"
+    for base in HLTV_API_BASES:
+        try:
+            url = base.rstrip("/") + "/matches"
+            r = requests.get(url, timeout=8)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            out = []
+            now_ts = int(datetime.utcnow().timestamp())
+            max_ts = now_ts + MAX_LOOKAHEAD_DAYS * 24 * 3600
+            # JSON format varies by deployment; try to detect list of matches with fields
+            if isinstance(j, dict) and "matches" in j:
+                items = j["matches"]
+            elif isinstance(j, list):
+                items = j
+            elif isinstance(j, dict) and "data" in j:
+                items = j["data"]
             else:
-                continue  # не похоже на матч
-
-        # коэффициенты — ищем рядом числа 1.23
-        coef1 = coef2 = None
-        nearby = a.parent.find_all(text=re.compile(r"\d+[\.,]\d+")) if a.parent else []
-        nums = []
-        for t in nearby:
-            s = t.strip().replace(",", ".")
-            try:
-                nums.append(float(s))
-            except:
-                pass
-        if len(nums) >= 2:
-            coef1, coef2 = nums[0], nums[1]
-
-        # время старта — попытаемся найти в атрибутах
-        start_ts = None
-        for attr in ("data-time","data-start","data-unix","data-ts"):
-            if a.has_attr(attr):
+                items = j
+            for it in items:
+                # try common fields
                 try:
-                    v = int(a[attr])
-                    if v > 1e10:
-                        v = v // 1000
-                    start_ts = v
+                    # HLTV API variants: may contain 'id' or 'matchId', 'team1', 'team2', 'startTime'
+                    match_id = str(it.get("id") or it.get("matchId") or it.get("match_id") or it.get("url") or "")
+                    team1 = (it.get("team1") or it.get("team1Name") or (it.get("team1", {}) .get("name") if isinstance(it.get("team1"), dict) else None))
+                    team2 = (it.get("team2") or it.get("team2Name") or (it.get("team2", {}) .get("name") if isinstance(it.get("team2"), dict) else None))
+                    # start time fields variants
+                    start_ts = None
+                    for k in ("startTime","beginAt","startTimestamp","time","date"):
+                        if k in it and it[k]:
+                            try:
+                                v = int(it[k])
+                                if v > 1e10:
+                                    v = v // 1000
+                                start_ts = v
+                                break
+                            except:
+                                # maybe ISO string
+                                try:
+                                    parsed = datetime.fromisoformat(it[k].replace("Z", "+00:00"))
+                                    start_ts = int(parsed.timestamp())
+                                    break
+                                except:
+                                    pass
+                    # odds
+                    coef1 = None
+                    coef2 = None
+                    # possible keys
+                    if "odds" in it and isinstance(it["odds"], (list,tuple)) and len(it["odds"])>=2:
+                        try:
+                            coef1 = float(it["odds"][0])
+                            coef2 = float(it["odds"][1])
+                        except:
+                            coef1 = coef2 = None
+                    else:
+                        # sometimes nested
+                        coef1 = it.get("team1Odds") or it.get("odds1")
+                        coef2 = it.get("team2Odds") or it.get("odds2")
+                        try:
+                            coef1 = float(coef1) if coef1 else None
+                            coef2 = float(coef2) if coef2 else None
+                        except:
+                            coef1 = coef2 = None
+                    # link
+                    link = it.get("link") or it.get("url") or (HLTV_SITE_BASE + "/matches/" + match_id if match_id else None)
+                    # sanity checks
+                    if not team1 or not team2 or not start_ts:
+                        continue
+                    if start_ts < now_ts or start_ts > max_ts:
+                        continue
+                    out.append({
+                        "match_id": match_id or re.sub(r"\\W+","_",link or str(start_ts)),
+                        "name": f"{team1} / {team2}",
+                        "team1": team1,
+                        "team2": team2,
+                        "start_ts": start_ts,
+                        "coef1": coef1,
+                        "coef2": coef2,
+                        "link": link
+                    })
+                except Exception:
+                    continue
+            if out:
+                return out
+        except Exception as e:
+            # try next base
+            print("hltv api try failed for base", base, "error", e)
+            continue
+    return []
+
+def scrape_hltv_matches():
+    """
+    Scrape https://www.hltv.org/matches for upcoming matches and return list similar to API.
+    """
+    try:
+        r = requests.get(HLTV_SITE_MATCHES, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "lxml")
+        now = datetime.utcnow()
+        max_dt = now + timedelta(days=MAX_LOOKAHEAD_DAYS)
+        results = []
+        # HLTV structure: divs with class 'match' inside 'upcomingMatches' / 'match-day'
+        # We'll search for anchors that link to /matches/{id}/...
+        anchors = soup.select("a[href^='/matches/']")
+        seen = set()
+        for a in anchors:
+            href = a.get("href")
+            if not href:
+                continue
+            link = HLTV_SITE_BASE + href
+            if link in seen:
+                continue
+            seen.add(link)
+            # team names often in nested spans
+            teams = a.select(".matchTeamName") or a.select(".team-name") or a.select(".matchTeam")
+            # fallback: extract by text split on 'vs' or '/'
+            text = a.get_text(" ", strip=True)
+            m = re.search(r"(.+?)\\s*(?:vs|v|—|\\-|/)\\s*(.+)", text, re.IGNORECASE)
+            if m:
+                t1 = m.group(1).strip()
+                t2 = m.group(2).strip()
+            else:
+                parts = text.split("/")
+                if len(parts) >= 2:
+                    t1 = parts[0].strip(); t2 = parts[1].strip()
+                else:
+                    # try sibling elements
+                    t_spans = a.find_all(text=True)
+                    if len(t_spans) < 2:
+                        continue
+                    t1 = t_spans[0].strip(); t2 = t_spans[1].strip()
+            # get start time: look for time attribute in parent rows
+            start_ts = None
+            # try to find a datetime attribute within parent
+            parent = a
+            for _ in range(4):
+                if parent is None:
                     break
+                time_tag = parent.find("div", class_="matchTime") or parent.find("time")
+                if time_tag and time_tag.get("datetime"):
+                    try:
+                        dt = time_tag["datetime"]
+                        parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                        start_ts = int(parsed.timestamp()); break
+                    except:
+                        pass
+                parent = parent.parent
+            # fallback: search near text for dd Mon or HH:MM
+            if start_ts is None:
+                nearby = a.parent.get_text(" ", strip=True)
+                mdt = re.search(r"(\\d{1,2}[:]\\d{2})", nearby)
+                if mdt:
+                    hhmm = mdt.group(1)
+                    try:
+                        today = datetime.utcnow()
+                        parsed = datetime.strptime(hhmm, "%H:%M").replace(year=today.year, month=today.month, day=today.day)
+                        if parsed < today - timedelta(minutes=10):
+                            parsed = parsed + timedelta(days=1)
+                        start_ts = int(parsed.timestamp())
+                    except:
+                        start_ts = None
+            if start_ts is None:
+                continue
+            if start_ts < int(datetime.utcnow().timestamp()):
+                continue
+            if start_ts > int((datetime.utcnow() + timedelta(days=MAX_LOOKAHEAD_DAYS)).timestamp()):
+                continue
+            # coefficients: HLTV may not include odds; we'll leave None if not found
+            coef1 = coef2 = None
+            # try to find numbers nearby
+            nums = re.findall(r"\\d+[\\.,]\\d+", a.parent.get_text(" ", strip=True))
+            if len(nums) >= 2:
+                try:
+                    coef1 = float(nums[0].replace(",", "."))
+                    coef2 = float(nums[1].replace(",", "."))
                 except:
-                    pass
-
-        match_id = re.sub(r"\W+", "_", link)
-        out.append({
-            "match_id": match_id,
-            "name": name,
-            "team1": t1,
-            "team2": t2,
-            "start_ts": start_ts,
-            "coef1": coef1,
-            "coef2": coef2,
-            "link": link
-        })
-    # unique by id, preserve first occurrence
-    uniq = {}
-    for m in out:
-        if m["match_id"] not in uniq:
-            uniq[m["match_id"]] = m
-    return list(uniq.values())
-
-def get_cs_matches_and_cache():
-    html = fetch(WINLINE_URL)
-    if not html:
+                    coef1 = coef2 = None
+            results.append({
+                "match_id": href.strip("/").replace("/", "_"),
+                "name": f"{t1} / {t2}",
+                "team1": t1,
+                "team2": t2,
+                "start_ts": start_ts,
+                "coef1": coef1,
+                "coef2": coef2,
+                "link": link
+            })
+        return results
+    except Exception as e:
+        print("scrape_hltv_matches error", e)
         return []
-    matches = parse_matches(html)
-    # cache to DB
+
+def get_upcoming_matches():
+    # try API first
+    matches = try_hltv_api_matches()
+    if matches:
+        return matches
+    # fallback to scraping
+    return scrape_hltv_matches()
+
+# ---------------- Commands / interaction ----------------
+def cmd_start(chat_id, user_id):
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    r = cur.fetchone()
+    if not r:
+        cur.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, START_BALANCE))
+        conn.commit()
+        tg_send(chat_id, f"🎉 Привет! Тебе начислено {START_BALANCE:.0f} Peek.")
+    else:
+        tg_send(chat_id, "Вы уже зарегистрированы. /balance — посмотреть баланс.")
+
+def cmd_balance(chat_id, user_id):
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    r = cur.fetchone()
+    if not r:
+        tg_send(chat_id, "Сначала отправьте /start")
+    else:
+        tg_send(chat_id, f"💰 Баланс: {r[0]:.2f} Peek")
+
+def cmd_help(chat_id):
+    txt = ("📘 Инструкция:\n"
+           "• /matches — список предстоящих матчей CS в ближайшие 7 дней\n"
+           "• Нажмите на матч → выберите команду (кнопка) → введите сумму\n"
+           "• Сумма списывается сразу. После завершения матча вы получите уведомление.\n")
+    tg_send(chat_id, txt)
+
+def cmd_matches(chat_id):
+    matches = get_upcoming_matches()
+    if not matches:
+        tg_send(chat_id, "⚠️ Не удалось получить предстоящие матчи CS.")
+        return
+    # cache into DB
+    now = int(datetime.utcnow().timestamp())
+    kb = {"inline_keyboard": []}
     for m in matches:
+        # only upcoming within limit already ensured
         cur.execute("""
             INSERT OR REPLACE INTO matches_cache
             (match_id, name, team1, team2, start_ts, coef1, coef2, link, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (m["match_id"], m["name"], m["team1"], m["team2"], m["start_ts"] or 0,
-              m["coef1"] or 0.0, m["coef2"] or 0.0, m["link"], "upcoming"))
+              m.get("coef1") or 0.0, m.get("coef2") or 0.0, m.get("link") or "", "upcoming"))
     conn.commit()
-    return matches
-
-# ---------------------------
-# Логика команд и колбеков
-# ---------------------------
-def handle_start(chat_id: int, user_id: int):
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("INSERT INTO users (user_id, balance) VALUES (?, ?)", (user_id, START_BALANCE))
-        conn.commit()
-        tg_send_message(chat_id, f"🎉 Добро пожаловать! Вам начислено {START_BALANCE:.0f} Peek.")
-    else:
-        tg_send_message(chat_id, "Вы уже зарегистрированы. Используйте /balance, чтобы посмотреть баланс.")
-
-def handle_balance(chat_id: int, user_id: int):
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        tg_send_message(chat_id, "Сначала отправьте /start")
-        return
-    tg_send_message(chat_id, f"💰 Ваш баланс: {row[0]:.2f} Peek")
-
-def handle_help(chat_id: int):
-    txt = ("📘 Инструкция по ставкам:\n\n"
-           "1) /matches — получить список доступных матчей Counter-Strike (ближайшая неделя).\n"
-           "2) Нажать на матч — бот покажет команды и коэффициенты.\n"
-           "3) Выберите /pick1 или /pick2 (через кнопку) — затем введите сумму в Peek.\n"
-           "4) Сумма списывается сразу. После завершения матча бот сообщит результат и начислит выигрыш (amount * coef) если вы угадали.\n")
-    tg_send_message(chat_id, txt)
-
-def handle_matches(chat_id: int):
-    matches = get_cs_matches_and_cache()
-    if not matches:
-        tg_send_message(chat_id, "⚠️ Не удалось получить список матчей. Попробуйте позже.")
-        return
-    kb = {"inline_keyboard": []}
     for m in matches:
-        start = datetime.utcfromtimestamp(m['start_ts']).strftime("%Y-%m-%d %H:%M UTC") if m['start_ts'] else "время неизвестно"
+        start = datetime.utcfromtimestamp(m["start_ts"]).strftime("%Y-%m-%d %H:%M UTC")
         label = f"{m['team1']} / {m['team2']} — {start}"
         kb["inline_keyboard"].append([{"text": label, "callback_data": f"match|{m['match_id']}"}])
-    tg_send_message(chat_id, "Выберите матч (Counter-Strike):", reply_markup=kb)
+    tg_send(chat_id, "Выберите матч (предстоящие):", reply_markup=kb)
 
-def handle_pick_command(chat_id: int, user_id: int, match_id: str, pick_number: int):
-    # get match from cache
-    cur.execute("SELECT name, team1, team2, coef1, coef2 FROM matches_cache WHERE match_id=?", (match_id,))
+def cmd_place_pick(chat_id, user_id, match_id, pick):
+    cur.execute("SELECT name, team1, team2, coef1, coef2, start_ts FROM matches_cache WHERE match_id=?", (match_id,))
     row = cur.fetchone()
     if not row:
-        tg_send_message(chat_id, "Информация по матчу недоступна.")
+        tg_send(chat_id, "Информация по матчу недоступна.")
         return
-    name, t1, t2, c1, c2 = row
-    team = t1 if pick_number == 1 else t2
-    coef = c1 if pick_number == 1 else c2
-    # save session awaiting amount
-    user_sessions[user_id] = {"stage": "await_amount", "match_id": match_id, "team": team, "coef": coef, "match_name": name}
-    tg_send_message(chat_id, f"Вы выбрали <b>{team}</b> (коэф {coef}). Введите сумму в Peek (числом).")
+    name, t1, t2, c1, c2, start_ts = row
+    team = t1 if pick == 1 else t2
+    coef = c1 if pick == 1 else c2
+    # set session to await amount
+    user_sessions[user_id] = {"stage":"await_amount", "match_id":match_id, "team":team, "coef":coef or 1.0, "match_name":name}
+    tg_send(chat_id, f"Вы выбрали <b>{team}</b> (коэф {coef}). Введите сумму в Peek (числом).")
 
-# ---------------------------
-# Разбор сообщений и callback_query из webhook
-# ---------------------------
+# ---------------- Webhook receiver ----------------
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
-    # message text
+    # handle messages
     if "message" in data:
         msg = data["message"]
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
-        text = msg.get("text", "").strip()
-
-        # If user expecting amount input
-        session = user_sessions.get(user_id)
-        if session and session.get("stage") == "await_amount" and text and re.match(r"^\d+(\.\d+)?$", text):
-            amount = float(text)
-            # validate balance
-            cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                tg_send_message(chat_id, "Сначала отправьте /start")
+        text = msg.get("text","").strip()
+        # awaiting amount?
+        sess = user_sessions.get(user_id)
+        if sess and sess.get("stage") == "await_amount":
+            if re.match(r"^\d+(\.\d+)?$", text):
+                amount = float(text)
+                # check balance
+                cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+                r = cur.fetchone()
+                if not r:
+                    tg_send(chat_id, "Сначала отправьте /start")
+                    user_sessions.pop(user_id, None)
+                    return {"ok": True}
+                balance = r[0]
+                if amount <= 0 or amount > balance:
+                    tg_send(chat_id, f"Неверная сумма. Баланс: {balance:.2f} Peek")
+                    return {"ok": True}
+                # create bet and deduct
+                cur.execute("INSERT INTO bets (user_id, match_id, match_name, team, amount, coef, placed_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (user_id, sess["match_id"], sess["match_name"], sess["team"], amount, sess["coef"], datetime.utcnow().isoformat(), "pending"))
+                cur.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+                conn.commit()
+                tg_send(chat_id, f"✅ Ставка принята: {amount:.2f} Peek на <b>{sess['team']}</b> (коэф {sess['coef']}).")
                 user_sessions.pop(user_id, None)
                 return {"ok": True}
-            balance = row[0]
-            if amount <= 0 or amount > balance:
-                tg_send_message(chat_id, f"Неверная сумма. Ваш баланс: {balance:.2f} Peek")
+            else:
+                tg_send(chat_id, "Введите сумму числом (например: 150).")
                 return {"ok": True}
-            # create bet: status pending, amount set, balance deducted
-            cur.execute("INSERT INTO bets (user_id, match_id, match_name, team, amount, coef, placed_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (user_id, session["match_id"], session["match_name"], session["team"], amount, session["coef"], datetime.utcnow().isoformat(), "pending"))
-            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
-            conn.commit()
-            tg_send_message(chat_id, f"✅ Ставка принята: {amount:.2f} Peek на {session['team']} (коэф {session['coef']}). Удачи!")
-            user_sessions.pop(user_id, None)
-            return {"ok": True}
-
         # commands
         if text == "/start":
-            handle_start(chat_id, user_id)
-            return {"ok": True}
+            cmd_start(chat_id, user_id); return {"ok": True}
         if text == "/balance":
-            handle_balance(chat_id, user_id)
-            return {"ok": True}
+            cmd_balance(chat_id, user_id); return {"ok": True}
         if text == "/help":
-            handle_help(chat_id)
-            return {"ok": True}
+            cmd_help(chat_id); return {"ok": True}
         if text == "/matches":
-            handle_matches(chat_id)
-            return {"ok": True}
-        # inline pick via typed commands like /pick1_<id> or /pick2_<id> (fallback)
+            cmd_matches(chat_id); return {"ok": True}
+        # typed fallback pick: /pick1_<id>
         m = re.match(r"^/pick([12])_?(.+)?$", text)
         if m:
-            pick_num = int(m.group(1))
-            mid = m.group(2) if m.group(2) else None
+            pick = int(m.group(1)); mid = m.group(2)
             if not mid:
-                tg_send_message(chat_id, "Неверная команда /pick. Используйте кнопку или /matches и затем /pick1_<id>.")
+                tg_send(chat_id, "Неверная команда /pick. Используйте /matches и кнопки.")
                 return {"ok": True}
-            handle_pick_command(chat_id, user_id, mid, pick_num)
-            return {"ok": True}
+            cmd_place_pick(chat_id, user_id, mid, pick); return {"ok": True}
+        tg_send(chat_id, "Неизвестная команда. Введите /help."); return {"ok": True}
 
-        # unknown text
-        tg_send_message(chat_id, "Неизвестная команда. Введите /help для списка команд.")
-        return {"ok": True}
-
-    # callback_query (кнопки)
+    # callbacks (inline buttons)
     if "callback_query" in data:
         cb = data["callback_query"]
         cid = cb["id"]
         from_id = cb["from"]["id"]
-        data_str = cb.get("data", "")
-        # match selection
-        if data_str.startswith("match|"):
-            _, mid = data_str.split("|", 1)
-            # store selected match and show options pick1/pick2 as buttons
+        d = cb.get("data","")
+        if d.startswith("match|"):
+            _, mid = d.split("|",1)
             cur.execute("SELECT name, team1, team2, coef1, coef2 FROM matches_cache WHERE match_id=?", (mid,))
             row = cur.fetchone()
             if not row:
-                tg_send_message(from_id, "Информация по матчу недоступна.")
+                tg_send(from_id, "Информация по матчу недоступна.")
                 tg_answer_callback(cid, "Ошибка")
                 return {"ok": True}
             name, t1, t2, c1, c2 = row
-            text = f"Вы выбрали: <b>{name}</b>\n\n1) {t1} — {c1}\n2) {t2} — {c2}\n\nНажмите кнопку, чтобы поставить:"
-            kb = {"inline_keyboard": [
+            text = f"Вы выбрали: <b>{name}</b>\n1) {t1} — {c1}\n2) {t2} — {c2}\n\nНажмите кнопку для ставки:"
+            kb = {"inline_keyboard":[
                 [{"text": f"Поставить на {t1}", "callback_data": f"pick|{mid}|1"}],
                 [{"text": f"Поставить на {t2}", "callback_data": f"pick|{mid}|2"}]
             ]}
-            tg_send_message(from_id, text, reply_markup=kb)
-            tg_answer_callback(cid)
-            return {"ok": True}
-
-        # pick from inline buttons
-        if data_str.startswith("pick|"):
-            _, mid, picknum = data_str.split("|", 2)
+            tg_send(from_id, text, reply_markup=kb)
+            tg_answer_callback(cid); return {"ok": True}
+        if d.startswith("pick|"):
+            _, mid, picknum = d.split("|",2)
             picknum = int(picknum)
-            handle_pick_command(from_id, from_id, mid, picknum)  # chat_id and user_id are same here
-            tg_answer_callback(cid, "ОК")
-            return {"ok": True}
+            cmd_place_pick(from_id, from_id, mid, picknum)
+            tg_answer_callback(cid, "ОК"); return {"ok": True}
 
     return {"ok": True}
 
-# ---------------------------
-# Определение победителя по странице матча (эвристика)
-# ---------------------------
-def parse_winner_from_match_page(html: str, team1: str, team2: str):
+# ---------------- Winner detection ----------------
+def parse_winner_from_hltv_match_page(html: str, team1: str, team2: str):
     if not html:
         return None
     text = BeautifulSoup(html, "lxml").get_text(" ", strip=True).lower()
-    # look for phrases like "<team> победил" or "<team> win" or scores 2:0  etc.
+    # look for direct words
     for team in (team1, team2):
         if not team:
             continue
         tn = team.lower()
-        if tn in text:
-            # check nearby words
-            pattern = re.compile(re.escape(tn) + r".{0,40}(выигр|побед|win|won|winner)", re.IGNORECASE)
-            if re.search(pattern, text):
-                return team
-    # try score patterns
-    m = re.search(r"(\d+)\s*[:\-]\s*(\d+)", text)
+        if re.search(re.escape(tn) + r".{0,60}(won|winner|beat|defeated|defeat|победил|выигр)", text, re.IGNORECASE):
+            return team
+    # score patterns
+    m = re.search(r"(\\d+)\\s*[:\\-]\\s*(\\d+)", text)
     if m:
-        a, b = int(m.group(1)), int(m.group(2))
+        a = int(m.group(1)); b = int(m.group(2))
         if a > b:
             return team1
         if b > a:
             return team2
     return None
 
-# ---------------------------
-# Фоновая задача — проверка результатов и выдача выигрышей
-# ---------------------------
-async def background_result_checker():
+def get_match_page(link):
+    try:
+        r = requests.get(link, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        if r.status_code == 200:
+            return r.text
+    except Exception as e:
+        print("get_match_page error", e, link)
+    return None
+
+# ---------------- Background checker ----------------
+async def background_checker():
     await asyncio.sleep(5)
     while True:
         try:
-            # select pending match ids (distinct)
             cur.execute("SELECT DISTINCT match_id FROM bets WHERE status='pending'")
             rows = cur.fetchall()
             if not rows:
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
+                await asyncio.sleep(CHECK_INTERVAL); continue
             for (mid,) in rows:
-                # load match info
                 cur.execute("SELECT link, team1, team2 FROM matches_cache WHERE match_id=?", (mid,))
                 info = cur.fetchone()
                 if not info:
                     continue
                 link, team1, team2 = info
-                html = fetch(link) if link else None
-                winner = parse_winner_from_match_page(html, team1, team2)
+                # try HLTV API match endpoint first
+                winner = None
+                for base in HLTV_API_BASES:
+                    try:
+                        # common endpoints: /match/{id}.json or /matches/{id}.json
+                        for endpoint in (f"{base.rstrip('/')}/match/{mid}.json", f"{base.rstrip('/')}/matches/{mid}.json", f"{base.rstrip('/')}/match/{mid}", f"{base.rstrip('/')}/matches/{mid}"):
+                            try:
+                                r = requests.get(endpoint, timeout=6)
+                                if r.status_code != 200:
+                                    continue
+                                j = r.json()
+                                # try to detect winner in json
+                                if isinstance(j, dict):
+                                    # common fields
+                                    if j.get("winner"):
+                                        winner = j.get("winner")
+                                    elif j.get("result") and isinstance(j.get("result"), dict):
+                                        w = j["result"].get("winner")
+                                        if w:
+                                            winner = w
+                                    # try score
+                                    if "score1" in j and "score2" in j:
+                                        a = int(j.get("score1",0)); b = int(j.get("score2",0))
+                                        if a > b: winner = team1
+                                        elif b > a: winner = team2
+                                if winner:
+                                    break
+                            except Exception:
+                                continue
+                        if winner:
+                            break
+                    except Exception:
+                        continue
+                # fallback: parse match page HTML
+                if not winner:
+                    html = get_match_page(link)
+                    if html:
+                        winner = parse_winner_from_hltv_match_page(html, team1, team2)
                 if winner:
                     # process all pending bets for this match
                     cur.execute("SELECT id, user_id, team, amount, coef FROM bets WHERE match_id=? AND status='pending'", (mid,))
@@ -416,37 +537,42 @@ async def background_result_checker():
                             payout = amount * (coef if coef and coef > 0 else 1.0)
                             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (payout, uid))
                             cur.execute("UPDATE bets SET status='won' WHERE id=?", (bet_id,))
-                            tg_send_message(uid, f"🎉 Поздравляем! Ваша ставка на <b>{team}</b> выиграла. Выплата: {payout:.2f} Peek.")
+                            tg_send(uid, f"🎉 Поздравляем! Ваша ставка на <b>{team}</b> выиграла. Премия: {payout:.2f} Peek.")
                         else:
                             cur.execute("UPDATE bets SET status='lost' WHERE id=?", (bet_id,))
-                            tg_send_message(uid, f"☹️ Ваша ставка на <b>{team}</b> проиграла.")
+                            tg_send(uid, f"☹️ Ваша ставка на <b>{team}</b> проиграла.")
                     conn.commit()
-                else:
-                    # no winner yet, skip
-                    pass
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
-            print("background_result_checker error:", e)
+            print("background_checker error", e)
             await asyncio.sleep(CHECK_INTERVAL)
 
-# ---------------------------
-# Startup / webhook set
-# ---------------------------
+# ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup():
+    # prime cache
+    try:
+        matches = get_upcoming_matches()
+        for m in matches:
+            cur.execute("""
+            INSERT OR REPLACE INTO matches_cache
+            (match_id, name, team1, team2, start_ts, coef1, coef2, link, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (m["match_id"], m["name"], m["team1"], m["team2"], m["start_ts"] or 0,
+                  m.get("coef1") or 0.0, m.get("coef2") or 0.0, m.get("link") or "", "upcoming"))
+        conn.commit()
+    except Exception as e:
+        print("initial cache error", e)
     # start background checker
-    asyncio.create_task(background_result_checker())
-    # set webhook if WEBHOOK_FULL provided
+    asyncio.create_task(background_checker())
+    # set webhook automatically if provided
     if WEBHOOK_FULL:
         try:
-            requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": WEBHOOK_FULL}, timeout=10)
-            print("Webhook set to", WEBHOOK_FULL)
+            resp = requests.get(f"{TELEGRAM_API}/setWebhook", params={"url": WEBHOOK_FULL}, timeout=10)
+            print("setWebhook response:", resp.status_code, resp.text)
         except Exception as e:
-            print("Error setting webhook:", e)
+            print("setWebhook failed:", e)
 
-# ---------------------------
-# Run
-# ---------------------------
+# ---------------- Run ----------------
 if __name__ == "__main__":
-    # for local testing you can set WEBHOOK_BASE to http ngrok url and run this file
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
