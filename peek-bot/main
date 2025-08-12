@@ -10,7 +10,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = 8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", "8000"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
@@ -306,5 +306,6 @@ async def telegram_webhook(request: Request):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+
 
 
