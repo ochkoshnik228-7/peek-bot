@@ -1,7 +1,5 @@
-fastapi
-uvicorn
+pyTelegramBotAPI
+Flask
 requests
-beautifulsoup4
-lxml
 
 
