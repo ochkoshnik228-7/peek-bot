@@ -1,132 +1,423 @@
 import os
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
+
 import requests
-import sqlite3
-from datetime import datetime, timedelta
-from flask import Flask, request
-import telebot
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
-BOT_TOKEN = "8314578862:AAFmgkZTLNaPFQCiDiqCZtUNeTxWK3MghFA"
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# ------------------ CONFIG ------------------
+TELEGRAM_TOKEN = "8307763623:AAHBWKqlY_Ys8BGojmwNSsFOEpDR-2BxEvo"
+PANDASCORE_TOKEN = "c3jff6TYOnQfs1Hmce1qhBIgJRZQmJ9CvW_vuhdx1VbKStUfR9o"
 
-# Подключение к БД
-conn = sqlite3.connect("users.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance REAL)")
-cursor.execute("CREATE TABLE IF NOT EXISTS bets (user_id INTEGER, match_id TEXT, team TEXT, amount REAL, coef REAL)")
-conn.commit()
+DATA_FILE = "peek_data.json"
+BASE_URL = "https://api.pandascore.co"  # (документация указывает .co)
+# --------------------------------------------
 
-# Список предстоящих матчей
-def get_upcoming_matches():
-    url = "https://hltv-api.vercel.app/api/matches"
-    r = requests.get(url)
-    matches = r.json()
-    now = datetime.utcnow()
-    upcoming = []
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("peek-bot")
+
+WELCOME_BONUS = 10_000
+DEFAULT_ODDS = (1.90, 1.90)  # если недоступны реальные коэффициенты
+MAX_MATCHES = 10             # сколько матчей показывать в /matches
+CHECK_INTERVAL_SEC = 180     # как часто проверять исходы матчей
+
+# ---------- простейшее JSON-хранилище ----------
+def _load() -> Dict[str, Any]:
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            log.exception("Ошибка чтения %s, стартуем с пустой БД", DATA_FILE)
+    return {}
+
+def _save(db: Dict[str, Any]) -> None:
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DATA_FILE)
+
+DB = _load()
+# структура DB:
+# {
+#   "<user_id>": {
+#       "balance": int,
+#       "bonus_claimed": bool,
+#       "open_bet": { ... } | null,
+#       "selected_match": int | null
+#   },
+#   "_bets": {
+#       "<bet_id>": {
+#            "user_id": str,
+#            "match_id": int,
+#            "team_id": int,
+#            "team_name": str,
+#            "odds": float,
+#            "amount": int,
+#            "status": "placed"|"won"|"lost",
+#            "placed_at": iso8601
+#       }
+#   }
+# }
+
+def ensure_user(uid: str) -> Dict[str, Any]:
+    if uid not in DB:
+        DB[uid] = {"balance": 0, "bonus_claimed": False, "open_bet": None, "selected_match": None}
+        _save(DB)
+    return DB[uid]
+
+def add_bet_record(rec: Dict[str, Any]) -> str:
+    DB.setdefault("_bets", {})
+    bet_id = f"{rec['user_id']}:{rec['match_id']}:{int(datetime.now(timezone.utc).timestamp())}"
+    DB["_bets"][bet_id] = rec
+    _save(DB)
+    return bet_id
+
+# -------------- PandaScore helpers --------------
+def ps_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {PANDASCORE_TOKEN}"}
+
+def get_upcoming_cs_matches() -> List[Dict[str, Any]]:
+    """
+    Возвращает список матчей CS (CS:GO/CS2) со статусом not_started в следующие 7 дней.
+    """
+    now = datetime.now(timezone.utc)
+    week = now + timedelta(days=7)
+
+    # В PandaScore до сих пор используется путь /csgo для CS2 (см. их миграционные доки).
+    # Фильтруем по статусу и диапазону начала.
+    params = {
+        "filter[status]": "not_started",
+        "range[begin_at]": f"{now.isoformat()},{week.isoformat()}",
+        "per_page": MAX_MATCHES,
+        "sort": "begin_at"
+    }
+    url = f"{BASE_URL}/csgo/matches"
+    r = requests.get(url, headers=ps_headers(), params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def safe_team_pair(match: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    opp = match.get("opponents") or []
+    if len(opp) != 2:
+        return None
+    # opponents[i]["opponent"] -> { "id": int, "name": str }
+    t1 = opp[0].get("opponent") or {}
+    t2 = opp[1].get("opponent") or {}
+    if not t1.get("id") or not t2.get("id"):
+        return None
+    return t1, t2
+
+def try_get_odds(match_id: int, team1_id: int, team2_id: int) -> Tuple[float, float]:
+    """
+    Пробуем вытащить коэф-ты у PandaScore (если доступно в тарифе).
+    В публичной референсе odds-эндпоинт не задокументирован, поэтому делаем
+    несколько "разумных" попыток и падаем на дефолт.
+    """
+    candidates = [
+        f"{BASE_URL}/csgo/matches/{match_id}/odds",
+        f"{BASE_URL}/matches/{match_id}/odds",
+    ]
+    for url in candidates:
+        try:
+            r = requests.get(url, headers=ps_headers(), timeout=15)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            data = r.json()
+            # ожидаем формат с рынком "match_winner" и decimal odds
+            # подбираем лучшую линию (берём первые доступные)
+            if isinstance(data, list) and data:
+                # пытаемся найти moneyline / match_winner
+                for market in data:
+                    lines = market.get("lines") or market.get("markets") or []
+                    if isinstance(lines, dict):
+                        lines = [lines]
+                    for line in lines:
+                        sel = line.get("selections") or line.get("outcomes") or []
+                        # ищем по team_id
+                        o1 = next((s for s in sel if str(s.get("team_id")) == str(team1_id)), None)
+                        o2 = next((s for s in sel if str(s.get("team_id")) == str(team2_id)), None)
+                        if o1 and o2:
+                            od1 = float(o1.get("odds_decimal") or o1.get("odds") or DEFAULT_ODDS[0])
+                            od2 = float(o2.get("odds_decimal") or o2.get("odds") or DEFAULT_ODDS[1])
+                            # минимальные sanity-проверки
+                            if od1 >= 1.01 and od2 >= 1.01:
+                                return round(od1, 2), round(od2, 2)
+        except requests.RequestException:
+            log.exception("Ошибка запроса odds %s", url)
+        except Exception:
+            log.exception("Неожиданный формат odds %s", url)
+    return DEFAULT_ODDS
+
+def get_match(match_id: int) -> Optional[Dict[str, Any]]:
+    url = f"{BASE_URL}/matches/{match_id}"
+    try:
+        r = requests.get(url, headers=ps_headers(), timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        # запасной путь для csgo
+        try:
+            url2 = f"{BASE_URL}/csgo/matches/{match_id}"
+            r2 = requests.get(url2, headers=ps_headers(), timeout=15)
+            r2.raise_for_status()
+            return r2.json()
+        except Exception:
+            log.exception("Не удалось получить матч %s", match_id)
+            return None
+
+# ---------------- Bot command handlers ----------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    user = ensure_user(uid)
+    if not user["bonus_claimed"]:
+        user["balance"] += WELCOME_BONUS
+        user["bonus_claimed"] = True
+        _save(DB)
+        await update.message.reply_text("Вы получили 10 000 peek! 🪙")
+    else:
+        await update.message.reply_text("Бонус уже был получен. Добро пожаловать обратно!")
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    user = ensure_user(uid)
+    await update.message.reply_text(f"Ваш баланс: {user['balance']} peek 🪙")
+
+def fmt_decimal(x: float) -> str:
+    # В примере запятая — приведём к ней
+    return f"{x:.2f}".replace(".", ",")
+
+async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure_user(uid)
+
+    try:
+        matches = get_upcoming_cs_matches()
+    except requests.HTTPError as e:
+        log.exception("PandaScore HTTP error: %s", e)
+        await update.message.reply_text("Не удалось получить список матчей (ошибка PandaScore). Попробуйте позже.")
+        return
+    except Exception:
+        log.exception("Unexpected error fetching matches")
+        await update.message.reply_text("Не удалось получить список матчей. Попробуйте позже.")
+        return
+
+    view: List[Dict[str, Any]] = []
+    lines = []
+    idx = 1
     for m in matches:
-        if m.get("event", {}).get("name") and "counter" in m.get("game", "").lower():
-            match_time = datetime.fromisoformat(m["date"].replace("Z", "+00:00"))
-            if now <= match_time <= now + timedelta(days=7):
-                upcoming.append(m)
-    return upcoming
+        pair = safe_team_pair(m)
+        if not pair:
+            continue
+        t1, t2 = pair
+        # коэффициенты
+        od1, od2 = try_get_odds(m["id"], t1["id"], t2["id"])
+        begin_at = m.get("begin_at") or m.get("scheduled_at")
+        when = begin_at or ""
+        try:
+            # нормализуем дату к локальному виду коротко
+            dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            when_str = dt.strftime("%d.%m %H:%M UTC")
+        except Exception:
+            when_str = str(when)
 
-# /start
-@bot.message_handler(commands=["start"])
-def start(msg):
-    user_id = msg.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        cursor.execute("INSERT INTO users VALUES (?, ?)", (user_id, 10000))
-        conn.commit()
-        bot.send_message(user_id, "Добро пожаловать! На ваш счёт зачислено 10000 Peek.")
+        lines.append(f"{idx}. {t1['name']} {fmt_decimal(od1)} VS {t2['name']} {fmt_decimal(od2)}  —  {when_str}")
+        view.append({
+            "idx": idx,
+            "match_id": m["id"],
+            "team1": {"id": t1["id"], "name": t1["name"], "odds": od1},
+            "team2": {"id": t2["id"], "name": t2["name"], "odds": od2},
+        })
+        idx += 1
+
+    if not view:
+        await update.message.reply_text("Нет ближайших подходящих матчей.")
+        return
+
+    # сохраним список матчей в user_data сессии
+    context.user_data["matches_view"] = view
+    await update.message.reply_text(
+        "Выберите матч (ответьте числом 1–{n}), затем используйте /command1 или /command2:\n\n{lst}".format(
+            n=len(view), lst="\n".join(lines)
+        )
+    )
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # обработка выбора матча и суммы ставки
+    uid = str(update.effective_user.id)
+    user = ensure_user(uid)
+    text = (update.message.text or "").strip()
+
+    # 1) выбор матча номером
+    if "matches_view" in context.user_data and context.user_data["matches_view"]:
+        if text.isdigit():
+            choice = int(text)
+            view: List[Dict[str, Any]] = context.user_data["matches_view"]
+            picked = next((v for v in view if v["idx"] == choice), None)
+            if picked:
+                user["selected_match"] = picked["match_id"]
+                # сохраним выбранные данные, чтобы потом не искать
+                context.user_data["selected"] = picked
+                _save(DB)
+                await update.message.reply_text(
+                    f"Вы выбрали матч #{choice}. Теперь нажмите /command1 (левая команда) или /command2 (правая)."
+                )
+                return
+        # если не число — продолжаем проверять на сумму ниже (ставка)
+    # 2) ввод суммы ставки
+    if user.get("open_bet") and "awaiting_amount" in user["open_bet"] and user["open_bet"]["awaiting_amount"]:
+        try:
+            amount = int(text.replace(" ", ""))
+        except ValueError:
+            await update.message.reply_text("Введите целое число — сумму ставки в peek.")
+            return
+        if amount <= 0:
+            await update.message.reply_text("Сумма должна быть положительной.")
+            return
+        if amount > user["balance"]:
+            await update.message.reply_text("Недостаточно peek!")
+            return
+        # списание и фиксация ставки
+        sel = user["open_bet"]["selection"]  # dict with team info & odds
+        user["balance"] -= amount
+        bet_rec = {
+            "user_id": uid,
+            "match_id": user["open_bet"]["match_id"],
+            "team_id": sel["id"],
+            "team_name": sel["name"],
+            "odds": sel["odds"],
+            "amount": amount,
+            "status": "placed",
+            "placed_at": datetime.now(timezone.utc).isoformat()
+        }
+        add_bet_record(bet_rec)
+        user["open_bet"] = None
+        _save(DB)
+        await update.message.reply_text("Ваша ставка принята!")
+        return
+
+    # иначе игнорим произвольный текст
+    # (можно подсказать команды)
+    # await update.message.reply_text("Доступные команды: /start /matches /balance")
+
+async def _prepare_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, pick_left: bool):
+    uid = str(update.effective_user.id)
+    user = ensure_user(uid)
+    if user["balance"] <= 0:
+        await update.message.reply_text("На балансе 0. Пополните бонусом через /start (один раз) или ждите исходов прошлых ставок.")
+        return
+
+    selected = context.user_data.get("selected")
+    if not selected or user.get("selected_match") != selected["match_id"]:
+        await update.message.reply_text("Сначала выберите матч командой /matches и номером из списка.")
+        return
+
+    team = selected["team1"] if pick_left else selected["team2"]
+    user["open_bet"] = {
+        "match_id": selected["match_id"],
+        "selection": {"id": team["id"], "name": team["name"], "odds": float(team["odds"])},
+        "awaiting_amount": True
+    }
+    _save(DB)
+    await update.message.reply_text(f"Вы выбрали {team['name']}. Сколько peek ставишь?")
+
+async def cmd_command1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _prepare_bet(update, context, pick_left=True)
+
+async def cmd_command2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _prepare_bet(update, context, pick_left=False)
+
+# -------------- Settlement job --------------
+def _settle_bet(bet_id: str, bet: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """
+    Возвращает (message, delta_balance) если был засчитан результат; иначе None.
+    """
+    m = get_match(bet["match_id"])
+    if not m:
+        return None
+    status = m.get("status")
+    if status != "finished":
+        return None
+    winner = m.get("winner") or {}
+    winner_id = winner.get("id")
+    if not winner_id:
+        # иногда winner может быть null при отмене — в таком случае просто возвращаем ставку
+        # (можно обозначить как push/void). Вернём средства без выигрыша.
+        delta = bet["amount"]
+        msg = "Матч отменён/без результата — ставка возвращена."
+        return msg, delta
+    if int(winner_id) == int(bet["team_id"]):
+        win_amount = int(round(bet["amount"] * float(bet["odds"])))
+        delta = win_amount  # начисляем полный выигрыш (ставка * коэффициент)
+        msg = "Ваша ставка зашла! 🎉"
     else:
-        bot.send_message(user_id, "С возвращением!")
-    bot.send_message(user_id, "Доступные команды:\n/start\n/balance\n/matches\n/help")
+        delta = 0  # баланс не изменяется
+        msg = "Ваша ставка не зашла :("
+    return msg, delta
 
-# /balance
-@bot.message_handler(commands=["balance"])
-def balance(msg):
-    user_id = msg.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    if row:
-        bot.send_message(user_id, f"Ваш баланс: {row[0]} Peek")
-    else:
-        bot.send_message(user_id, "Вы ещё не зарегистрированы. Напишите /start.")
+async def job_check_bets(context: ContextTypes.DEFAULT_TYPE):
+    DB.setdefault("_bets", {})
+    changed = False
+    for bet_id, bet in list(DB["_bets"].items()):
+        if bet.get("status") != "placed":
+            continue
+        res = _settle_bet(bet_id, bet)
+        if not res:
+            continue
+        msg, delta = res
+        uid = bet["user_id"]
+        user = ensure_user(uid)
+        if delta:
+            user["balance"] += delta
+        bet["status"] = "won" if delta else "lost"
+        changed = True
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=msg + (f"\nТекущий баланс: {user['balance']} peek 🪙" if msg else "")
+            )
+        except Exception:
+            log.exception("Не удалось отправить сообщение пользователю %s", uid)
+    if changed:
+        _save(DB)
 
-# /help
-@bot.message_handler(commands=["help"])
-def help_cmd(msg):
-    bot.send_message(msg.chat.id, "Команды:\n/matches — список матчей\n/balance — баланс\nПосле выбора матча выберите команду и укажите ставку.")
+# -------------------- main --------------------
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# /matches
-@bot.message_handler(commands=["matches"])
-def matches_cmd(msg):
-    matches = get_upcoming_matches()
-    if not matches:
-        bot.send_message(msg.chat.id, "Нет предстоящих матчей по CS в течение недели.")
-        return
-    text = "Выберите матч, отправив его номер:\n"
-    for i, m in enumerate(matches):
-        text += f"{i+1}. {m['team1']['name']} vs {m['team2']['name']}\n"
-    bot.send_message(msg.chat.id, text)
-    bot.register_next_step_handler(msg, lambda m: choose_match(m, matches))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("matches", cmd_matches))
+    app.add_handler(CommandHandler("command1", cmd_command1))
+    app.add_handler(CommandHandler("command2", cmd_command2))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-# Выбор матча
-def choose_match(msg, matches):
-    try:
-        idx = int(msg.text) - 1
-        match = matches[idx]
-    except:
-        bot.send_message(msg.chat.id, "Неверный выбор.")
-        return
-    text = f"{match['team1']['name']} ({match['odds']['team1']}) / {match['team2']['name']} ({match['odds']['team2']})\nВыберите команду (1 или 2):"
-    bot.register_next_step_handler(msg, lambda m: choose_team(m, match))
+    # периодически проверяем исходы
+    app.job_queue.run_repeating(job_check_bets, interval=CHECK_INTERVAL_SEC, first=15)
 
-# Выбор команды
-def choose_team(msg, match):
-    if msg.text not in ["1", "2"]:
-        bot.send_message(msg.chat.id, "Введите 1 или 2.")
-        return
-    team = match["team1"]["name"] if msg.text == "1" else match["team2"]["name"]
-    coef = match["odds"]["team1"] if msg.text == "1" else match["odds"]["team2"]
-    bot.send_message(msg.chat.id, f"Введите сумму ставки на {team}:")
-    bot.register_next_step_handler(msg, lambda m: place_bet(m, match, team, coef))
+    # --- polling (проще всего запустить где угодно)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Ставка
-def place_bet(msg, match, team, coef):
-    user_id = msg.from_user.id
-    try:
-        amount = float(msg.text)
-    except:
-        bot.send_message(user_id, "Введите число.")
-        return
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    bal = cursor.fetchone()
-    if not bal or bal[0] < amount:
-        bot.send_message(user_id, "Недостаточно средств.")
-        return
-    cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (bal[0] - amount, user_id))
-    cursor.execute("INSERT INTO bets VALUES (?, ?, ?, ?, ?)", (user_id, match["id"], team, amount, coef))
-    conn.commit()
-    bot.send_message(user_id, "Ставка принята!")
-
-# Flask для вебхука
-@app.route("/" + BOT_TOKEN, methods=["POST"])
-def webhook():
-    update = request.stream.read().decode("utf-8")
-    bot.process_new_updates([telebot.types.Update.de_json(update)])
-    return "OK", 200
-
-@app.route("/")
-def index():
-    return "Bot is running!"
+    # Если захочешь webhook на Render (пример):
+    # BASE = os.environ.get("PUBLIC_URL", "https://peek-bot.onrender.com")
+    # PORT = int(os.environ.get("PORT", "8080"))
+    # app.run_webhook(
+    #     listen="0.0.0.0",
+    #     port=PORT,
+    #     url_path=TELEGRAM_TOKEN,
+    #     webhook_url=f"{BASE}/{TELEGRAM_TOKEN}",
+    #     allowed_updates=Update.ALL_TYPES
+    # )
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url="https://peek-bot.onrender.com/" + BOT_TOKEN)
-    app.run(host="0.0.0.0", port=5000)
-flask
-pyTelegramBotAPI
-requests
+    # import uvloop; uvloop.install()  # опционально
+    main()
